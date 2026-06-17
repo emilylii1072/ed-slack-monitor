@@ -1,0 +1,5 @@
+{
+  "hooks": {
+    "get-hooks": "./.venv/bin/python -m slack_cli_hooks.hooks.get_hooks"
+  }
+}

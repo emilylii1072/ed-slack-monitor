@@ -1,0 +1,7 @@
+pytest==9.0.3
+ruff==0.15.15
+slack-bolt==1.28.0
+slack-cli-hooks<1.0.0
+requests
+python-dotenv
+slack_sdk
