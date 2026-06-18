@@ -10,6 +10,7 @@ docs/.doctrees
 __pycache__/
 *.so
 *~
+token.txt
 
 # virtualenv
 env*/
