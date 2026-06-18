@@ -1,0 +1,60 @@
+name: Ed Slack Monitor
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ed-slack-monitor
+  cancel-in-progress: false
+
+jobs:
+  check-ed:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Restore alerts database
+        uses: actions/cache@v4
+        with:
+          path: alerts.db
+          key: alerts-db-${{ github.run_id }}
+          restore-keys: |
+            alerts-db-
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Ed monitor once
+        env:
+          RUN_ONCE: "true"
+
+          ED_REGION: "us"
+          ED_API_TOKEN: ${{ secrets.ED_API_TOKEN }}
+          ED_COURSE_ID: ${{ secrets.ED_COURSE_ID }}
+
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          ED_LEAD_SLACK_ID: ${{ secrets.ED_LEAD_SLACK_ID }}
+
+          ALERT_AFTER_HOURS: "8"
+          ALERT_MAX_AGE_DAYS: "7"
+
+          FETCH_LIMIT: "100"
+          FETCH_PAGE_SIZE: "100"
+
+          DEBUG_PRINT_THREADS: "false"
+          ED_AUTH_STYLE: "bearer"
+          DB_PATH: "alerts.db"
+        run: python main.py

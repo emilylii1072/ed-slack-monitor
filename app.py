@@ -458,6 +458,13 @@ def run_check_once() -> None:
 def main() -> None:
     init_db()
 
+    run_once = os.getenv("RUN_ONCE", "false").strip().lower() == "true"
+
+    if run_once:
+        print("Running one scheduled Ed check.")
+        run_check_once()
+        return
+
     print("Starting Ed unresolved-question monitor.")
     print(f"Checking every {CHECK_INTERVAL_SECONDS} seconds.")
     print(f"Alert window: {ALERT_AFTER_HOURS} hours old to {ALERT_MAX_AGE_DAYS} days old.")
