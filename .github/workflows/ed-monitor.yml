@@ -57,4 +57,4 @@ jobs:
           DEBUG_PRINT_THREADS: "false"
           ED_AUTH_STYLE: "bearer"
           DB_PATH: "alerts.db"
-        run: python main.py
+        run: python app.py
