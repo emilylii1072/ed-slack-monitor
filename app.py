@@ -1,5 +1,6 @@
 import os
 import sqlite3
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -19,11 +20,24 @@ ED_COURSE_ID = os.environ["ED_COURSE_ID"].strip()
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"].strip()
 ED_LEAD_SLACK_ID = os.environ["ED_LEAD_SLACK_ID"].strip()
 
+# Alert only for unresolved posts between these ages.
 ALERT_AFTER_HOURS = int(os.getenv("ALERT_AFTER_HOURS", "8"))
+ALERT_MAX_AGE_DAYS = int(os.getenv("ALERT_MAX_AGE_DAYS", "7"))
+
+# Fetch all Ed threads page by page, then keep the latest 100 by post number.
+FETCH_LIMIT = int(os.getenv("FETCH_LIMIT", "100"))
+FETCH_PAGE_SIZE = int(os.getenv("FETCH_PAGE_SIZE", "100"))
+
+# Keep checking forever.
+CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "300"))
+
 DB_PATH = os.getenv("DB_PATH", "alerts.db").strip()
 
-# Use the same auth style that worked in inspect_ed.py.
-# Most setups use Bearer. If yours only worked without Bearer, set ED_AUTH_STYLE=raw in .env.
+# For debugging.
+DEBUG_PRINT_THREADS = os.getenv("DEBUG_PRINT_THREADS", "false").strip().lower() == "true"
+
+# Most setups use Bearer.
+# If yours only worked without Bearer, set ED_AUTH_STYLE=raw in .env.
 ED_AUTH_STYLE = os.getenv("ED_AUTH_STYLE", "bearer").strip().lower()
 
 
@@ -70,6 +84,32 @@ def safe_int(value: Any, default: int = 0) -> int:
     except Exception:
         return default
 
+
+def slack_escape(value: Any) -> str:
+    """
+    Escapes text for Slack messages.
+    """
+    text = str(value)
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def get_category_name(thread: dict[str, Any]) -> str:
+    category = thread.get("category")
+
+    if isinstance(category, dict):
+        return str(category.get("name", "Uncategorized"))
+
+    if category:
+        return str(category)
+
+    return "Uncategorized"
+
+
+# ---------- Database ----------
 
 def init_db() -> None:
     with sqlite3.connect(DB_PATH) as conn:
@@ -120,36 +160,91 @@ def mark_alerted(thread: dict[str, Any]) -> None:
 
 
 # ---------- Ed API ----------
-
-def fetch_ed_threads(limit: int = 100) -> list[dict[str, Any]]:
+def fetch_ed_threads(limit: int = FETCH_LIMIT) -> list[dict[str, Any]]:
     """
-    Fetches recent Ed threads. This is enough for most courses if the script runs frequently.
-    If your course gets more than 100 posts between runs, increase limit or add pagination.
+    Fetches all Ed threads using pagination.
+
+    Then sorts all fetched threads by Ed post number from greatest to least,
+    and returns only the top `limit`.
+
+    Example order:
+    #500, #499, #498, ...
     """
     url = f"https://{ED_REGION}.edstem.org/api/courses/{ED_COURSE_ID}/threads"
 
-    response = requests.get(
-        url,
-        headers=ed_headers(),
-        params={
-            "limit": limit,
-            "offset": 0,
-        },
-        timeout=30,
+    all_threads: list[dict[str, Any]] = []
+    seen_thread_ids: set[str] = set()
+    offset = 0
+
+    while True:
+        response = requests.get(
+            url,
+            headers=ed_headers(),
+            params={
+                "limit": FETCH_PAGE_SIZE,
+                "offset": offset,
+            },
+            timeout=30,
+        )
+
+        if response.status_code != 200:
+            print("Ed API error")
+            print("Status:", response.status_code)
+            print("Response:", response.text[:2000])
+            response.raise_for_status()
+
+        data = response.json()
+
+        if not isinstance(data, dict):
+            raise RuntimeError(f"Unexpected Ed response shape: {type(data)}")
+
+        threads = data.get("threads", [])
+
+        if not isinstance(threads, list):
+            raise RuntimeError(f"Unexpected threads shape: {type(threads)}")
+
+        if not threads:
+            print(f"No threads returned at offset={offset}. Finished fetching pages.")
+            break
+
+        new_threads_this_page = 0
+
+        for thread in threads:
+            thread_id = str(thread.get("id"))
+
+            if not thread_id or thread_id == "None":
+                continue
+
+            if thread_id in seen_thread_ids:
+                continue
+
+            seen_thread_ids.add(thread_id)
+            all_threads.append(thread)
+            new_threads_this_page += 1
+
+        print(
+            f"Fetched page offset={offset}, "
+            f"page_threads={len(threads)}, "
+            f"new_unique_threads={new_threads_this_page}, "
+            f"total_unique_threads={len(all_threads)}"
+        )
+
+        if len(threads) < FETCH_PAGE_SIZE:
+            print("Last page was smaller than page size. Finished fetching pages.")
+            break
+
+        if new_threads_this_page == 0:
+            print("No new unique threads found on this page. Stopping pagination.")
+            break
+
+        offset += FETCH_PAGE_SIZE
+
+    all_threads.sort(
+        key=lambda thread: safe_int(thread.get("number"), 0),
+        reverse=True,
     )
 
-    if response.status_code != 200:
-        print("Ed API error")
-        print("Status:", response.status_code)
-        print("Response:", response.text[:2000])
-        response.raise_for_status()
-
-    data = response.json()
-
-    if isinstance(data, dict):
-        return data.get("threads", [])
-
-    raise RuntimeError(f"Unexpected Ed response shape: {type(data)}")
+    return all_threads[:limit]
 
 
 def is_question(thread: dict[str, Any]) -> bool:
@@ -160,36 +255,42 @@ def is_deleted_or_archived(thread: dict[str, Any]) -> bool:
     return bool(thread.get("deleted_at")) or bool(thread.get("is_archived"))
 
 
-def is_old_enough(thread: dict[str, Any], cutoff: datetime) -> bool:
+def is_old_enough(thread: dict[str, Any], stale_cutoff: datetime) -> bool:
     created_at_raw = thread.get("created_at")
 
     if not created_at_raw:
         return False
 
     created_at = parse_ed_time(created_at_raw)
-    return created_at <= cutoff
+    return created_at <= stale_cutoff
 
 
-def is_unanswered_or_unresolved(thread: dict[str, Any]) -> bool:
+def is_not_too_old(thread: dict[str, Any], oldest_cutoff: datetime) -> bool:
+    created_at_raw = thread.get("created_at")
+
+    if not created_at_raw:
+        return False
+
+    created_at = parse_ed_time(created_at_raw)
+    return created_at >= oldest_cutoff
+
+
+def is_unresolved(thread: dict[str, Any]) -> bool:
     """
-    Main rule:
-    Alert if a question is not answered, not staff answered, or has unresolved followups.
+    Alert only if the Ed post itself is not resolved/answered.
+    Ignores unresolved comments and follow-ups.
     """
     is_answered = bool(thread.get("is_answered", False))
-    is_staff_answered = bool(thread.get("is_staff_answered", False))
-    unresolved_count = safe_int(thread.get("unresolved_count"), 0)
-
-    unanswered = not is_answered
-    not_staff_answered = not is_staff_answered
-    has_unresolved_followups = unresolved_count > 0
-
-    return unanswered or not_staff_answered or has_unresolved_followups
+    return not is_answered
 
 
-def find_stale_threads(threads: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=ALERT_AFTER_HOURS)
+def find_unresolved_threads(threads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    now = datetime.now(timezone.utc)
 
-    stale = []
+    stale_cutoff = now - timedelta(hours=ALERT_AFTER_HOURS)
+    oldest_cutoff = now - timedelta(days=ALERT_MAX_AGE_DAYS)
+
+    unresolved_threads = []
 
     for thread in threads:
         thread_id = str(thread.get("id"))
@@ -197,6 +298,7 @@ def find_stale_threads(threads: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not thread_id or thread_id == "None":
             continue
 
+        # Prevent repeat notifications.
         if already_alerted(thread_id):
             continue
 
@@ -206,40 +308,83 @@ def find_stale_threads(threads: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if is_deleted_or_archived(thread):
             continue
 
-        if not is_old_enough(thread, cutoff):
+        # Must be at least ALERT_AFTER_HOURS old.
+        if not is_old_enough(thread, stale_cutoff):
             continue
 
-        if not is_unanswered_or_unresolved(thread):
+        # Must not be older than ALERT_MAX_AGE_DAYS.
+        if not is_not_too_old(thread, oldest_cutoff):
             continue
 
-        stale.append(thread)
+        # Only posts that are not resolved/answered.
+        if not is_unresolved(thread):
+            continue
 
-    return stale
+        unresolved_threads.append(thread)
+
+    return unresolved_threads
+
+
+# ---------- Debugging ----------
+
+def debug_print_threads(threads: list[dict[str, Any]]) -> None:
+    if not DEBUG_PRINT_THREADS:
+        return
+
+    print("\n--- Top threads by number, greatest to least ---")
+
+    for index, thread in enumerate(threads, start=1):
+        thread_id = thread.get("id")
+        thread_number = thread.get("number", thread_id)
+        title = thread.get("title", "(untitled question)")
+        thread_type = thread.get("type")
+        created_at = thread.get("created_at")
+        is_answered = thread.get("is_answered")
+        deleted_at = thread.get("deleted_at")
+        is_archived = thread.get("is_archived")
+
+        already_seen = already_alerted(str(thread_id)) if thread_id else False
+
+        print(
+            f"{index}. #{thread_number} | "
+            f"id={thread_id} | "
+            f"type={thread_type} | "
+            f"created_at={created_at} | "
+            f"is_answered={is_answered} | "
+            f"deleted_at={deleted_at} | "
+            f"is_archived={is_archived} | "
+            f"already_alerted={already_seen} | "
+            f"title={title}"
+        )
+
+    print("--- End top threads ---\n")
 
 
 # ---------- Slack ----------
 
 def ed_thread_url(thread: dict[str, Any]) -> str:
-    thread_number = thread.get("number", thread.get("id"))
-    return f"https://edstem.org/{ED_REGION}/courses/{ED_COURSE_ID}/discussion/{thread_number}"
+    """
+    Ed links should use the discussion ID, not the displayed post number.
+    """
+    thread_id = thread.get("id")
+    return f"https://edstem.org/{ED_REGION}/courses/{ED_COURSE_ID}/discussion/{thread_id}"
 
 
 def format_thread_line(thread: dict[str, Any]) -> str:
     thread_number = thread.get("number", thread.get("id"))
-    title = thread.get("title", "(untitled question)")
+    title = slack_escape(thread.get("title", "(untitled question)"))
     url = ed_thread_url(thread)
 
     created_at = parse_ed_time(thread["created_at"])
     age_hours = int((datetime.now(timezone.utc) - created_at).total_seconds() // 3600)
 
     reply_count = safe_int(thread.get("reply_count"), 0)
-    unresolved_count = safe_int(thread.get("unresolved_count"), 0)
-    category = thread.get("category") or "Uncategorized"
+    category = slack_escape(get_category_name(thread))
 
     return (
         f"• <{url}|#{thread_number}: {title}> "
         f"— {age_hours}h old, {reply_count} replies, "
-        f"{unresolved_count} unresolved, category: {category}"
+        f"category: {category}"
     )
 
 
@@ -256,21 +401,22 @@ def open_dm_with_lead(client: WebClient) -> str:
     return response["channel"]["id"]
 
 
-def post_slack_alert(stale_threads: list[dict[str, Any]]) -> None:
+def post_slack_alert(unresolved_threads: list[dict[str, Any]]) -> None:
     client = WebClient(token=SLACK_BOT_TOKEN)
 
     dm_channel_id = open_dm_with_lead(client)
 
-    shown_threads = stale_threads[:10]
+    shown_threads = unresolved_threads[:10]
     thread_lines = "\n".join(format_thread_line(thread) for thread in shown_threads)
 
     extra = ""
-    if len(stale_threads) > 10:
-        extra = f"\n…and {len(stale_threads) - 10} more."
+    if len(unresolved_threads) > 10:
+        extra = f"\n…and {len(unresolved_threads) - 10} more."
 
     text = (
-        f"Hi <@{ED_LEAD_SLACK_ID}> — there are {len(stale_threads)} Ed question(s) "
-        f"older than {ALERT_AFTER_HOURS} hours that still look unanswered or unresolved:\n\n"
+        f"Hi <@{ED_LEAD_SLACK_ID}> — there are {len(unresolved_threads)} Ed question(s) "
+        f"between {ALERT_AFTER_HOURS} hours and {ALERT_MAX_AGE_DAYS} days old "
+        f"that are not resolved:\n\n"
         f"{thread_lines}"
         f"{extra}"
     )
@@ -282,28 +428,55 @@ def post_slack_alert(stale_threads: list[dict[str, Any]]) -> None:
     )
 
 
-# ---------- Main ----------
+# ---------- Main loop ----------
+
+def run_check_once() -> None:
+    print(f"[{datetime.now(timezone.utc).isoformat()}] Fetching all Ed threads...")
+
+    threads = fetch_ed_threads(limit=FETCH_LIMIT)
+
+    print(f"Using top {len(threads)} thread(s) by greatest post number.")
+    debug_print_threads(threads)
+
+    unresolved_threads = find_unresolved_threads(threads)
+
+    if not unresolved_threads:
+        print("No new unresolved Ed questions in the alert window.")
+        return
+
+    print(f"Found {len(unresolved_threads)} unresolved question(s). DMing Ed lead...")
+
+    # Only mark as alerted after the Slack message succeeds.
+    post_slack_alert(unresolved_threads)
+
+    for thread in unresolved_threads:
+        mark_alerted(thread)
+
+    print(f"Sent Slack DM and marked {len(unresolved_threads)} thread(s) as alerted.")
+
 
 def main() -> None:
     init_db()
 
-    print("Fetching Ed threads...")
-    threads = fetch_ed_threads(limit=100)
+    print("Starting Ed unresolved-question monitor.")
+    print(f"Checking every {CHECK_INTERVAL_SECONDS} seconds.")
+    print(f"Alert window: {ALERT_AFTER_HOURS} hours old to {ALERT_MAX_AGE_DAYS} days old.")
+    print(f"Fetching all Ed threads, then keeping top {FETCH_LIMIT} by greatest post number.")
+    print(f"Fetch page size: {FETCH_PAGE_SIZE}.")
+    print("Press Ctrl+C to stop.")
 
-    print(f"Fetched {len(threads)} thread(s).")
-    stale_threads = find_stale_threads(threads)
+    while True:
+        try:
+            run_check_once()
+        except KeyboardInterrupt:
+            print("\nStopped Ed unresolved-question monitor.")
+            break
+        except Exception as error:
+            print("Error during check:")
+            print(repr(error))
+            print("Continuing after sleep...")
 
-    if not stale_threads:
-        print("No new stale unanswered/unresolved Ed questions.")
-        return
-
-    print(f"Found {len(stale_threads)} stale question(s). DMing Ed lead...")
-    post_slack_alert(stale_threads)
-
-    for thread in stale_threads:
-        mark_alerted(thread)
-
-    print(f"Sent Slack DM and marked {len(stale_threads)} thread(s) as alerted.")
+        time.sleep(CHECK_INTERVAL_SECONDS)
 
 
 if __name__ == "__main__":
